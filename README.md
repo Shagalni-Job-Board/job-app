@@ -1,245 +1,133 @@
-<div align="center">
+# Shagalni — Job App
 
-# 💼 Shagalni — Job Seeker Application
+This repository contains the job-seeker-facing application of the Shagalni platform. It is the public Laravel app where candidates browse vacancies, view details, submit applications, upload or reuse resumes, and track the status of each application.
 
-**The job-seeker–facing app of the Shagalni job board platform**, built with **Laravel 12**.
-Job seekers browse open vacancies, apply with a résumé, and receive an **AI-generated compatibility score and feedback** — powered by Google Gemini — without ever waiting on the API call, thanks to a fully asynchronous processing pipeline.
+## Purpose
 
-[![Laravel](https://img.shields.io/badge/Laravel-12-FF2D20?logo=laravel&logoColor=white)](https://laravel.com)
-[![PHP](https://img.shields.io/badge/PHP-%5E8.2-777BB4?logo=php&logoColor=white)](https://www.php.net)
-[![Tailwind CSS](https://img.shields.io/badge/Tailwind-3-38B2AC?logo=tailwindcss&logoColor=white)](https://tailwindcss.com)
-[![Pest](https://img.shields.io/badge/Tested%20with-Pest-EF3B4E)](https://pestphp.com)
-[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](#license)
+The main purpose of this project is to help job seekers discover openings and apply to them from a simple web interface. The app also connects to the shared domain models from job-shared and uses a queued AI workflow to evaluate a submitted resume against a job vacancy.
 
-</div>
+## Main technologies
 
----
-
-## About Shagalni
-
-**Shagalni** is a Laravel-based job board platform split into three repositories that share one database and one domain layer:
-
-| Repository | Role |
-|---|---|
-| **job-app** *(this repo)* | Public-facing application for **job seekers** — search, apply, track applications |
-| [job-backoffice](https://github.com/YoussefSayed-cs/job-backoffice) | Admin & company-owner dashboard — manage vacancies, review applicants |
-| [job-shared](https://github.com/YoussefSayed-cs/job-shared) | Shared Eloquent models & notifications used by both apps |
-
-This README covers **job-app** specifically.
-
-## Table of Contents
-
-- [Features](#features)
-- [Tech Stack](#tech-stack)
-- [How the AI Scoring Pipeline Works](#how-the-ai-scoring-pipeline-works)
-- [Data Model](#data-model)
-- [Route Map](#route-map)
-- [Project Structure](#project-structure)
-- [Getting Started](#getting-started)
-- [Environment Variables](#environment-variables)
-- [Testing](#testing)
-- [Related Repositories](#related-repositories)
-- [License](#license)
-
----
-
-## Features
-
-- **Job search & discovery** — searchable, filterable vacancy listing (keyword search across title / location / company name, plus filtering by job type) with pagination on the seeker dashboard.
-- **Vacancy details page** — full description, location, and type for a single opening.
-- **Apply with an existing résumé or upload a new one** — at apply time, a job seeker can reuse a previously uploaded résumé (skipping re-parsing entirely) or upload a new PDF on the spot.
-- **AI-powered résumé screening, fully asynchronous:**
-  - The application is saved and a response returned to the user **immediately** (`status: pending`, score `0`) — the user never waits on the AI call.
-  - A queued job extracts structured résumé data (contact info, education, experience, skills) from the PDF — only for a *new* résumé; a reused résumé skips straight to scoring, saving an API call.
-  - The résumé is then scored against the specific job description, producing a 0–100 compatibility score and 2–4 sentences of evidence-based feedback.
-  - Automatic retries with backoff on rate limits (`429`) or upstream errors (`503`); if analysis ultimately fails, a safe fallback message is stored instead of leaving the application stuck.
-- **Applicant dashboard** — job seekers track the status (pending / accepted / rejected) and AI feedback for every application they've submitted, and can download the résumé attached to each one.
-- **Notifications** — the company owner (and platform admins) are notified whenever a new application comes in for one of their vacancies.
-- **Role-protected routes** — every seeker-facing route is guarded by a `role:job-seeker` middleware.
-
-## Tech Stack
-
-| Layer | Technology |
-|---|---|
-| Backend | Laravel 12, PHP ^8.2 |
-| Frontend | Blade templates, Tailwind CSS 3, Alpine.js, Vite |
-| Database | MariaDB / MySQL |
-| Auth | Laravel Breeze (session-based) |
-| AI | Google Gemini (`gemini-2.5-flash`) via `google-gemini-php/laravel` + direct HTTP calls |
-| PDF parsing | `smalot/pdfparser` |
-| File storage | S3-compatible cloud storage (`league/flysystem-aws-s3-v3`, `aws/aws-sdk-php`) |
-| Queues | Database-backed queue for background résumé analysis |
-| Testing | Pest 4 |
-| Shared domain layer | [`job/shared`](https://github.com/YoussefSayed-cs/job-shared) private Composer package |
-
-## How the AI Scoring Pipeline Works
-
-```text
-User applies with a résumé (PDF)
-        │
-        ▼
-JobVacancyController::processApplications()
-   ├─ saves the application immediately  (status: pending, score: 0)
-   └─ dispatches ProcessResumeAnalysis   (queued job)
-                    │
-                    ▼
-        ProcessResumeAnalysis  (tries: 3 · timeout: 300s · backoff: 60s → 120s → 180s)
-                    │
-                    ▼
-        ResumesAnalysisServices
-   ├─ new résumé?  → Gemini call #1: extract structured data from the PDF text
-   │                 (skipped for a reused résumé — data already on file)
-   └─               → Gemini call #2: score the résumé against the job description
-                    │
-                    ▼
-        Application updated with aiGeneratedScore (0–100) + aiGeneratedFeedback
-```
-
-The user gets an instant response ("Your application has been submitted — AI evaluation is in progress") while the scoring happens in the background.
-
-**Two layers of resilience:**
-
-| Layer | Retries | Trigger |
-|---|---|---|
-| Inside `ResumesAnalysisServices` (per Gemini HTTP call) | up to 3 attempts, 10s apart | HTTP `429` (rate limited) or `503` (upstream unavailable) |
-| The queued job itself (`ProcessResumeAnalysis`) | up to 3 attempts, 60s → 120s → 180s apart | Any uncaught exception (e.g. inner retries exhausted, unreadable PDF, network failure) |
-
-If every attempt at the job level is exhausted, `failed()` stores a safe fallback message (`"AI evaluation is temporarily unavailable..."`) instead of leaving the application stuck at "in progress" forever.
-
-Both Gemini prompts are constrained to return **raw JSON only** (no markdown fences, no invented data — the model is explicitly instructed not to fabricate skills or experience not present in the résumé), which the service decodes directly into the fields stored on the `resumes` and `job_applications` tables.
-
-## Data Model
-
-This app **does not own its domain schema** — `User`, `company`, `job_vacancy`, `job_application`, and `resume` are Eloquent models that live in the shared [`job/shared`](https://github.com/YoussefSayed-cs/job-shared) package and point at tables created by **job-backoffice**'s migrations. The only migration in this repo is for the internal `jobs` (queue) table.
-
-| Table | What this app writes to it |
-|---|---|
-| `resumes` | New résumé record on upload (`filename`, `fileUri`, `contactDetails`), later filled in by the queue job (`summary`, `skills`, `experience`, `education`) |
-| `job_applications` | Created on apply (`status: pending`, `aiGeneratedScore: 0`), updated by the queue job with the final score and feedback |
-| `notifications` | A notification is created for the company owner (and admins) on every new application |
-
-## Route Map
-
-| Method | URI | Middleware | Action |
-|---|---|---|---|
-| GET | `/` | — | Public landing page — latest companies |
-| GET | `/dashboard` | `auth`, `role:job-seeker` | Vacancy search & listing |
-| GET | `/job-vacancies/{id}` | `auth`, `role:job-seeker` | Vacancy details |
-| GET | `/job-vacancies/{id}/apply` | `auth`, `role:job-seeker` | Apply form (choose/upload résumé) |
-| POST | `/job-vacancies/{id}/apply` | `auth`, `role:job-seeker` | Submit application, dispatch AI analysis |
-| GET | `/job-applications` | `auth`, `role:job-seeker` | My applications — status & AI feedback |
-| GET | `/job-applications/{id}/resume` | `auth`, `role:job-seeker` | Download a submitted résumé |
-| GET/PATCH/DELETE | `/profile` | `auth`, `role:job-seeker` | Manage own profile |
-| GET | `/up` | — | Laravel health-check endpoint |
-
-Plus the standard Breeze auth routes (`/login`, `/register`, `/forgot-password`, email verification, etc.) from `routes/auth.php`.
-
-## Project Structure
-
-```text
-app/
-├── Events/
-│   └── JobApplicationSubmitted.php
-├── Http/
-│   ├── Controllers/          # DashboardController, JobVacancyController,
-│   │                         # JobApplicationsController, ProfileController
-│   ├── Middleware/           # RoleMiddleware
-│   └── Requests/             # AbblyJobRequest (apply-form validation), ProfileUpdateRequest
-├── Jobs/
-│   └── ProcessResumeAnalysis.php   # background AI scoring
-├── Listeners/
-│   └── NotifyCompanyOwner.php
-├── Providers/
-│   └── AppServiceProvider.php
-├── Services/
-│   └── ResumesAnalysisServices.php # Gemini integration (extraction + scoring)
-└── View/Components/                # AppLayout, GuestLayout, MainLayout
-
-resources/views/
-├── dashboard.blade.php
-├── job-vacancies/            # show, apply
-├── job-applications/         # index
-├── welcome.blade.php
-├── layouts/ & components/
-└── auth/ & profile/
-
-database/migrations/          # internal `jobs` (queue) table only — domain tables come from job-backoffice
-routes/                       # web.php, auth.php, api.php, console.php
-```
-
-## Getting Started
-
-### Prerequisites
-
-- PHP ≥ 8.2
-- Composer
-- Node.js & npm
+- PHP 8.2
+- Laravel 12
+- Laravel Breeze
+- Blade + Tailwind CSS + Vite
 - MariaDB / MySQL
-- A Google Gemini API key
-- An S3-compatible bucket (for résumé storage)
+- Google Gemini API
+- AWS S3-compatible storage
+- Pest for tests
+- Composer package: job/shared
 
-### Installation
+## Main features
+
+- Public landing page showing recent companies
+- Job seeker dashboard
+- Vacancy details and application flow
+- Resume upload or reuse
+- Background AI analysis for resume-to-job matching
+- Application status tracking
+- Resume download from submitted applications
+- Database notifications for company owners and admins
+
+## Project structure
+
+- app/Http/Controllers: request handling for the seeker flow
+- app/Jobs: queued jobs such as resume analysis
+- app/Services: AI and resume-processing logic
+- app/Listeners: notification handling
+- app/Providers: Laravel service registration
+- resources/views: UI templates for the public and seeker pages
+- routes/web.php: public and protected seeker routes
+- database/migrations: local queue-related migration(s)
+
+## Installation
+
+1. Clone the repository:
+
+   ```bash
+   git clone https://github.com/YoussefSayed-cs/job-app.git
+   cd job-app
+   ```
+
+2. Install PHP dependencies:
+
+   ```bash
+   composer install
+   ```
+
+3. Install frontend dependencies:
+
+   ```bash
+   npm install
+   ```
+
+4. Copy the environment file:
+
+   ```bash
+   cp .env.example .env
+   ```
+
+5. Generate the application key:
+
+   ```bash
+   php artisan key:generate
+   ```
+
+## Environment configuration
+
+Edit the .env file and configure the required settings. The project includes the following important values in .env.example:
+
+- APP_NAME, APP_ENV, APP_URL, APP_DEBUG
+- DB_CONNECTION, DB_HOST, DB_PORT, DB_DATABASE, DB_USERNAME, DB_PASSWORD
+- SESSION_DRIVER and CACHE_STORE
+- QUEUE_CONNECTION=database
+- MAIL configuration
+- AWS access and bucket values
+- GEMINI_API_KEY
+
+Important: this app shares the same database as job-backoffice. The core application tables are owned by the shared domain layer and the backoffice project, so the DB credentials and database name should be aligned across the two apps.
+
+## Database setup and migrations
+
+This repository does not define the full domain schema by itself. The main model tables are provided by the shared package and created by the backoffice repository. This app still uses Laravel migrations for local queue support.
+
+To prepare the database:
 
 ```bash
-git clone https://github.com/Shagalni-Job-Board/job-app.git
-cd job-app
-
-composer install
-cp .env.example .env
-php artisan key:generate
-
-# configure your database, AWS, and GEMINI_API_KEY in .env, then:
 php artisan migrate
-
-npm install
-npm run build
 ```
 
-> **⚠️ Important — shared database.** This app ships **only** the internal `jobs` queue-table migration; the core domain tables (users, companies, vacancies, applications, résumés) are created by **job-backoffice**'s migrations. Point this app's `.env` at the **same database** (same `DB_HOST` / `DB_DATABASE` / credentials) and run job-backoffice's migrations first.
+If the shared schema has not been created yet, run the migrations in job-backoffice first and point both applications to the same database.
 
-### Running locally
+## Running locally
+
+Use the project script:
 
 ```bash
 composer dev
 ```
 
-This single command runs four processes concurrently:
+This runs the web server, queue worker, log viewer, and Vite frontend together. The queue worker is required because the resume-analysis process is handled asynchronously.
 
-| Process | What it does |
-|---|---|
-| `php artisan serve` | The Laravel dev server |
-| `php artisan queue:listen --tries=1` | **Required** — processes `ProcessResumeAnalysis`; without it, applications stay at "pending" forever |
-| `php artisan pail --timeout=0` | Live-tails the application log in your terminal |
-| `npm run dev` | Vite dev server with hot module reload |
-
-## Environment Variables
-
-| Variable | Purpose |
-|---|---|
-| `APP_NAME`, `APP_ENV`, `APP_URL`, `APP_DEBUG` | Standard Laravel app configuration |
-| `DB_CONNECTION`, `DB_HOST`, `DB_PORT`, `DB_DATABASE`, `DB_USERNAME`, `DB_PASSWORD` | Database connection — **must match job-backoffice's `.env`**, see note above |
-| `GEMINI_API_KEY` | Google Gemini API key, used for résumé parsing & scoring |
-| `QUEUE_CONNECTION` | Queue driver (`database` by default) — **must be running** for AI scoring |
-| `SESSION_DRIVER`, `SESSION_LIFETIME` | Session storage (database-backed by default) |
-| `CACHE_STORE` | Cache driver (`database` by default) |
-| `REDIS_HOST`, `REDIS_PORT`, `REDIS_PASSWORD` | Optional Redis configuration |
-| `MAIL_MAILER`, `MAIL_HOST`, `MAIL_PORT`, `MAIL_FROM_ADDRESS` | Outgoing mail (logged locally by default) |
-| `AWS_BUCKET`, `AWS_DEFAULT_REGION`, `AWS_ENDPOINT`, `AWS_URL`, `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY` | S3-compatible bucket for résumé storage, shared with job-backoffice |
-| `VITE_APP_NAME` | App name exposed to the frontend build |
-
-## Testing
+You can also start the app manually:
 
 ```bash
-composer test
+php artisan serve
+php artisan queue:listen --tries=1
+npm run dev
 ```
 
-Runs the Pest test suite (`tests/Feature`, `tests/Unit`) after clearing cached config.
+## Requirements
 
-## Related Repositories
+- PHP ^8.2
+- Composer
+- Node.js and npm
+- MariaDB or MySQL
+- Google Gemini API key
+- AWS S3-compatible bucket for resume storage
+- job-shared Composer package and job-backoffice project available in the same platform setup
 
-- [job-backoffice](https://github.com/YoussefSayed-cs/job-backoffice) — admin & company-owner management console
-- [job-shared](https://github.com/YoussefSayed-cs/job-shared) — shared Eloquent models & notifications package
+## Related repositories
 
-## License
-
-Released under the [MIT License](LICENSE) (as declared in `composer.json`).
+- job-backoffice: backoffice and admin dashboard for the platform
+- job-shared: shared models and notification definitions used by both apps
