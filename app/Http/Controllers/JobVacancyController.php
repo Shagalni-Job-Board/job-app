@@ -11,8 +11,10 @@ use App\Models\resume;
 use App\Services\ResumesAnalysisServices;
 use App\Notifications\newJobApply;
 use Illuminate\Http\Request;
+use Illuminate\Database\UniqueConstraintViolationException;
 use Illuminate\Support\Facades\Auth;
 use Illuminate\Support\Facades\Log;
+use Illuminate\Validation\ValidationException;
 
 class JobVacancyController extends Controller
 {
@@ -32,6 +34,16 @@ class JobVacancyController extends Controller
     public function apply(string $id)
     {
         $job_vacancy = job_vacancy::findOrFail($id);
+
+        $alreadyApplied = job_application::where('userID', Auth::id())
+            ->where('jobVacancyID', $job_vacancy->id)
+            ->exists();
+
+        if ($alreadyApplied) {
+            return redirect()->route('job-vacancy.show', $job_vacancy->id)
+                ->withErrors(['job_vacancy' => 'You have already applied to this job vacancy.']);
+        }
+
         $resumes = Auth::user()->resume;
 
         return view('job-vacancies.apply', compact('job_vacancy', 'resumes'));
@@ -40,6 +52,7 @@ class JobVacancyController extends Controller
     public function processApplications(AbblyJobRequest $request, string $id)
     {
         $job_vacancy  = job_vacancy::findOrFail($id);
+
         $resumeID     = null;
         $isNewResume  = false;
 
@@ -97,14 +110,22 @@ class JobVacancyController extends Controller
         | JOB APPLICATION — بنحفظها فوراً بـ score = 0 وstatus انتظار
         |------------------------------------------------------------------
         */
-        $jobApplication = job_application::create([
-            'status'              => 'pending',
-            'aiGeneratedScore'    => 0,
-            'aiGeneratedFeedback' => 'AI evaluation is in progress…',
-            'jobVacancyID'        => $job_vacancy->id,
-            'resumeID'            => $resumeID,
-            'userID'              => Auth::id(),
-        ]);
+        try {
+            $jobApplication = job_application::create([
+                'status'              => 'pending',
+                'aiGeneratedScore'    => 0,
+                'aiGeneratedFeedback' => 'AI evaluation is in progress…',
+                'jobVacancyID'        => $job_vacancy->id,
+                'resumeID'            => $resumeID,
+                'userID'              => Auth::id(),
+            ]);
+        } catch (UniqueConstraintViolationException) {
+            // The request validation handles the usual case. This handles
+            // concurrent submissions that reach the database together.
+            throw ValidationException::withMessages([
+                'job_vacancy' => 'You have already applied to this job vacancy.',
+            ]);
+        }
 
         /*
         |------------------------------------------------------------------

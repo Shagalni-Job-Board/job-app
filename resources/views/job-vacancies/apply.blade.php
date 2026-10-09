@@ -33,6 +33,8 @@
             <form x-data="{ fileName: '', isSubmitting: false }" @submit="isSubmitting = true" action="{{ route('job-vacancy.processApplications', $job_vacancy->id) }}" method="POST" enctype="multipart/form-data" class="space-y-8 mt-10 relative z-10 max-w-2xl">
                 @csrf
 
+                <x-input-error :messages="$errors->get('job_vacancy')" class="text-red-400" />
+
                 <!-- Resume Selection -->
                 <div>
                     <h3 class="font-heading text-xl font-bold text-white mb-6">Choose Your Resume</h3>
